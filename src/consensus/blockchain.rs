@@ -18,7 +18,7 @@ pub struct Blockchain<'state> {
 }
 
 impl<'state> Blockchain<'state> {
-    pub async fn new(
+    pub fn new(
         state: &'state mut InMemoryState,
         config: ChainSpec,
         genesis_block: Block,
@@ -32,7 +32,7 @@ impl<'state> Blockchain<'state> {
         .await
     }
 
-    pub async fn new_with_consensus(
+    pub fn new_with_consensus(
         state: &'state mut InMemoryState,
         engine: Box<dyn Consensus>,
         config: ChainSpec,
@@ -146,44 +146,43 @@ impl<'state> Blockchain<'state> {
         Ok(())
     }
 
-    async fn execute_block(
+    fn execute_block(
         &mut self,
         block: &BlockWithSenders,
         check_state_root: bool,
-    ) -> anyhow::Result<()> {
-        let body = BlockBodyWithSenders {
-            transactions: block.transactions.clone(),
-            ommers: block.ommers.clone(),
-        };
+    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
+        move |_| {
+            let body = BlockBodyWithSenders {
+                transactions: block.transactions.clone(),
+                ommers: block.ommers.clone(),
+            };
 
-        let block_spec = self.config.collect_block_spec(block.header.number);
+            let block_spec = self.config.collect_block_spec(block.header.number);
 
-        let mut analysis_cache = AnalysisCache::default();
-        let processor = ExecutionProcessor::new(
-            self.state,
-            None,
-            &mut analysis_cache,
-            &mut *self.engine,
-            &block.header,
-            &body,
-            &block_spec,
-        );
+            let mut analysis_cache = AnalysisCache::default();
+            let processor = ExecutionProcessor::new(
+                None,
+                &mut analysis_cache,
+                &mut *self.engine,
+                &block.header,
+                &body,
+                &block_spec,
+            );
 
-        let _ = processor.execute_and_write_block().await?;
+            let _ = processor.execute_and_write_block().await?;
 
-        if check_state_root {
-            let state_root = self.state.state_root_hash();
-            if state_root != block.header.state_root {
-                self.state.unwind_state_changes(block.header.number);
-                return Err(ValidationError::WrongStateRoot {
-                    expected: block.header.state_root,
-                    got: state_root,
+            if check_state_root {
+                let state_root = self.state.state_root_hash();
+                if state_root != block.header.state_root {
+                    self.state.unwind_state_changes(block.header.number);
+                    return Err(ValidationError::WrongStateRoot {
+                        expected: block.header.state_root,
+                        got: state_root,
+                    }
+                    .into());
                 }
-                .into());
             }
         }
-
-        Ok(())
     }
 
     async fn re_execute_canonical_chain(

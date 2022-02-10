@@ -1,4 +1,9 @@
-use super::{analysis_cache::AnalysisCache, root_hash, tracer::Tracer};
+use super::{
+    analysis_cache::AnalysisCache,
+    continuation::{interrupt_data::InterruptData, resume_data::ResumeData},
+    root_hash,
+    tracer::Tracer,
+};
 use crate::{
     chain::{
         intrinsic_gas::*,
@@ -9,20 +14,17 @@ use crate::{
         evm::{Revision, StatusCode},
         evmglue,
     },
-    h256_to_u256,
+    gen_await, h256_to_u256,
     models::*,
     state::IntraBlockState,
     State,
 };
 use anyhow::Context;
-use std::cmp::min;
+use std::{cmp::min, ops::Generator};
 use TransactionAction;
 
-pub struct ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
-where
-    S: State,
-{
-    state: IntraBlockState<'r, S>,
+pub struct ExecutionProcessor<'tracer, 'analysis, 'e, 'h, 'b, 'c> {
+    state: IntraBlockState,
     tracer: Option<&'tracer mut dyn Tracer>,
     analysis_cache: &'analysis mut AnalysisCache,
     engine: &'e mut dyn Consensus,
@@ -32,13 +34,8 @@ where
     cumulative_gas_used: u64,
 }
 
-impl<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
-    ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
-where
-    S: State,
-{
+impl<'tracer, 'analysis, 'e, 'h, 'b, 'c> ExecutionProcessor<'tracer, 'analysis, 'e, 'h, 'b, 'c> {
     pub fn new(
-        state: &'r mut S,
         tracer: Option<&'tracer mut dyn Tracer>,
         analysis_cache: &'analysis mut AnalysisCache,
         engine: &'e mut dyn Consensus,
@@ -47,7 +44,7 @@ where
         block_spec: &'c BlockExecutionSpec,
     ) -> Self {
         Self {
-            state: IntraBlockState::new(state),
+            state: IntraBlockState::new(),
             tracer,
             analysis_cache,
             engine,
@@ -62,11 +59,11 @@ where
         self.header.gas_limit - self.cumulative_gas_used
     }
 
-    pub(crate) fn state(&mut self) -> &mut IntraBlockState<'r, S> {
+    pub(crate) fn state(&mut self) -> &mut IntraBlockState {
         &mut self.state
     }
 
-    pub(crate) fn into_state(self) -> IntraBlockState<'r, S> {
+    pub(crate) fn into_state(self) -> IntraBlockState {
         self.state
     }
 
@@ -233,60 +230,64 @@ where
         Ok(receipts)
     }
 
-    pub async fn execute_and_write_block(mut self) -> anyhow::Result<Vec<Receipt>> {
-        let receipts = self.execute_block_no_post_validation().await?;
+    pub fn execute_and_write_block(
+        mut self,
+    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = Result<Vec<Receipt>, ValidationError>>
+    {
+        move |_| {
+            let receipts = gen_await!(self.execute_block_no_post_validation());
 
-        let gas_used = receipts.last().map(|r| r.cumulative_gas_used).unwrap_or(0);
+            let gas_used = receipts.last().map(|r| r.cumulative_gas_used).unwrap_or(0);
 
-        if gas_used != self.header.gas_used {
-            let transactions = receipts
-                .into_iter()
-                .enumerate()
-                .fold(
-                    (Vec::new(), 0),
-                    |(mut receipts, last_gas_used), (i, receipt)| {
-                        let gas_used = receipt.cumulative_gas_used - last_gas_used;
-                        receipts.push((i, gas_used));
-                        (receipts, receipt.cumulative_gas_used)
-                    },
-                )
-                .0;
-            return Err(ValidationError::WrongBlockGas {
-                expected: self.header.gas_used,
-                got: gas_used,
-                transactions,
+            if gas_used != self.header.gas_used {
+                let transactions = receipts
+                    .into_iter()
+                    .enumerate()
+                    .fold(
+                        (Vec::new(), 0),
+                        |(mut receipts, last_gas_used), (i, receipt)| {
+                            let gas_used = receipt.cumulative_gas_used - last_gas_used;
+                            receipts.push((i, gas_used));
+                            (receipts, receipt.cumulative_gas_used)
+                        },
+                    )
+                    .0;
+                return Err(ValidationError::WrongBlockGas {
+                    expected: self.header.gas_used,
+                    got: gas_used,
+                    transactions,
+                });
             }
-            .into());
-        }
 
-        let block_num = self.header.number;
-        let rev = self.block_spec.revision;
+            let block_num = self.header.number;
+            let rev = self.block_spec.revision;
 
-        if rev >= Revision::Byzantium {
-            let expected = root_hash(&receipts);
-            if expected != self.header.receipts_root {
-                return Err(ValidationError::WrongReceiptsRoot {
-                    expected,
-                    got: self.header.receipts_root,
+            if rev >= Revision::Byzantium {
+                let expected = root_hash(&receipts);
+                if expected != self.header.receipts_root {
+                    return Err(ValidationError::WrongReceiptsRoot {
+                        expected,
+                        got: self.header.receipts_root,
+                    }
+                    .into());
+                }
+            }
+
+            let expected_logs_bloom = receipts
+                .iter()
+                .fold(Bloom::zero(), |bloom, r| bloom | r.bloom);
+            if expected_logs_bloom != self.header.logs_bloom {
+                return Err(ValidationError::WrongLogsBloom {
+                    expected: expected_logs_bloom,
+                    got: self.header.logs_bloom,
                 }
                 .into());
             }
+
+            gen_await!(self.state.write_to_db(block_num));
+
+            Ok(receipts)
         }
-
-        let expected_logs_bloom = receipts
-            .iter()
-            .fold(Bloom::zero(), |bloom, r| bloom | r.bloom);
-        if expected_logs_bloom != self.header.logs_bloom {
-            return Err(ValidationError::WrongLogsBloom {
-                expected: expected_logs_bloom,
-                got: self.header.logs_bloom,
-            }
-            .into());
-        }
-
-        self.state.write_to_db(block_num).await?;
-
-        Ok(receipts)
     }
 
     async fn refund_gas(

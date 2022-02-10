@@ -1,4 +1,10 @@
-use crate::{crypto::*, models::*, util::*, State};
+use crate::{
+    crypto::*,
+    execution::continuation::interrupt::{Interrupt, StartedInterrupt},
+    models::*,
+    util::*,
+    State,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::{collections::HashMap, convert::TryInto};
@@ -214,6 +220,93 @@ impl InMemoryState {
                 } else {
                     e.insert(location, value);
                 }
+            }
+        }
+    }
+
+    pub fn execute<Return>(&mut self, gen: StartedInterrupt) -> Return {
+        let mut interrupt = gen.resume(());
+        loop {
+            interrupt = match interrupt {
+                Interrupt::ReadAccount { interrupt, address } => {
+                    interrupt.resume(self.accounts.get(&address).cloned())
+                }
+                Interrupt::ReadStorage {
+                    interrupt,
+                    address,
+                    location,
+                } => {
+                    let mut v = U256::ZERO;
+                    if let Some(storage) = self.storage.get(&address) {
+                        if let Some(value) = storage.get(&location) {
+                            v = *value;
+                        }
+                    }
+                    interrupt.resume(v)
+                }
+                Interrupt::ReadCode {
+                    interrupt,
+                    code_hash,
+                } => interrupt.resume(self.code.get(&code_hash).cloned().unwrap_or_default()),
+                Interrupt::EraseStorage {
+                    interrupt,
+                    address,
+                    location,
+                } => {
+                    let address_storage = self.storage.remove(&address).unwrap_or_default();
+
+                    if !address_storage.is_empty() {
+                        let storage_changes = self
+                            .storage_changes
+                            .entry(self.block_number)
+                            .or_default()
+                            .entry(address)
+                            .or_default();
+
+                        for (slot, initial) in address_storage {
+                            storage_changes.insert(slot, initial);
+                        }
+                    }
+                    interrupt.resume(())
+                }
+                Interrupt::ReadHeader {
+                    interrupt,
+                    block_number,
+                    block_hash,
+                } => todo!(),
+                Interrupt::ReadBody {
+                    interrupt,
+                    block_number,
+                    block_hash,
+                } => todo!(),
+                Interrupt::ReadTotalDifficulty {
+                    interrupt,
+                    block_number,
+                    block_hash,
+                } => todo!(),
+                Interrupt::BeginBlock {
+                    interrupt,
+                    block_number,
+                } => todo!(),
+                Interrupt::UpdateAccount {
+                    interrupt,
+                    address,
+                    initial,
+                    current,
+                } => todo!(),
+                Interrupt::UpdateCode {
+                    interrupt,
+                    code_hash,
+                    code,
+                } => todo!(),
+                Interrupt::UpdateStorage {
+                    interrupt,
+                    address,
+                    location,
+                    initial,
+                    current,
+                } => todo!(),
+                Interrupt::Complete { interrupt, result } => break result,
             }
         }
     }

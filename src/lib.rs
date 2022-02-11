@@ -11,7 +11,9 @@
     step_trait,
     type_alias_impl_trait,
     integer_atomics,
-    async_closure
+    async_closure,
+    const_try,
+    let_chains
 )]
 #![recursion_limit = "256"]
 #![allow(
